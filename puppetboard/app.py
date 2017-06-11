@@ -18,6 +18,7 @@ from flask import (
 
 from pypuppetdb import connect
 from pypuppetdb.QueryBuilder import *
+from pypuppetdb.utils import UTC
 
 from puppetboard.forms import QueryForm
 from puppetboard.utils import (
@@ -46,6 +47,19 @@ CATALOGS_COLUMNS = [
     {'attr': 'certname', 'name': 'Certname', 'type': 'node'},
     {'attr': 'catalog_timestamp', 'name': 'Compile Time'},
     {'attr': 'form', 'name': 'Compare'},
+]
+
+NODES_COLUMNS = [
+    {'attr': 'catalog_timestamp', 'filter': 'catalog_timestamp',
+     'name': 'Catalog', 'type': 'datetime'},
+    {'attr': 'status', 'filter': 'latest_report_status',
+     'name': 'Status', 'type': 'status'},
+    {'attr': 'name', 'filter': 'certname',
+     'name': 'Certname', 'type': 'node'},
+    {'attr': 'report_timestamp', 'filter': 'report_timestamp',
+     'name': 'Report', 'type': 'datetime'},
+    {'attr': 'report_timestamp', 'filter': 'report_timestamp',
+     'name': '', 'type': 'datetime'},
 ]
 
 app = Flask(__name__)
@@ -104,6 +118,94 @@ def environments():
     return x
 
 
+def get_reports_noop_query():
+    """Compatibility function building a query string
+    to select noop reports.
+    Direct access fields 'noop' and 'noop_pending' are not set
+    by 3.X clients on a 4.X database.
+    """
+    noop_event_query = EqualsOperator('status', 'noop')
+    noop_subquery = SubqueryOperator('events')
+    noop_subquery.add_query(noop_event_query)
+    noop_extract = ExtractOperator()
+    noop_extract.add_field(str('certname'))
+    noop_extract.add_query(noop_subquery)
+    noop_in_query = InOperator('certname')
+    noop_in_query.add_query(noop_extract)
+
+    other_event_query = NotOperator()
+    other_event_query.add(EqualsOperator('status', 'noop'))
+    other_subquery = SubqueryOperator('events')
+    other_subquery.add_query(other_event_query)
+    other_extract = ExtractOperator()
+    other_extract.add_field(str('certname'))
+    other_extract.add_query(other_subquery)
+    other_in_query = InOperator('certname')
+    other_in_query.add_query(other_extract)
+    other_not_in = NotOperator()
+    other_not_in.add(other_in_query)
+
+    result = AndOperator()
+    result.add([noop_in_query, other_not_in])
+    return result
+
+
+def get_node_unreported_time():
+    return (
+        datetime.datetime.utcnow() -
+        timedelta(hours=app.config['UNRESPONSIVE_HOURS'])
+    ).replace(microsecond=0, tzinfo=UTC())
+
+
+def get_node_status_query(status_arg):
+    """Return query selecting nodes matching status_arg status"""
+    if status_arg in ['failed', 'changed']:
+        arg_query = AndOperator()
+        arg_query.add(EqualsOperator('latest_report_status', status_arg))
+        arg_query.add(GreaterOperator(
+            'report_timestamp', get_node_unreported_time().isoformat()))
+        return arg_query
+    elif status_arg in ['noop', 'unchanged']:
+        arg_query = AndOperator()
+        status_op = OrOperator()
+        status_op.add(EqualsOperator('latest_report_status', 'unchanged'))
+        status_op.add(EqualsOperator('latest_report_status', 'noop'))
+        arg_query.add(status_op)
+        arg_query.add(GreaterOperator(
+            'report_timestamp', get_node_unreported_time().isoformat()))
+        return arg_query
+    elif status_arg == 'unreported':
+        arg_query = OrOperator()
+        arg_query.add(NullOperator('report_timestamp', True))
+        arg_query.add(LessEqualOperator(
+            'report_timestamp', get_node_unreported_time().isoformat()))
+        return arg_query
+    else:
+        raise Exception("Status %s is unknown" % status_arg)
+
+
+def get_count(endpoint, query):
+    c_query = ExtractOperator()
+    c_query.add_field(FunctionOperator('count'))
+    if query:
+        c_query.add_query(query)
+    res = get_or_abort(
+        puppetdb._query, endpoint,
+        query=c_query)
+    return res[0]['count']
+
+
+def get_node_env_query(env, *args):
+    query = AndOperator()
+    for i in args:
+        query.add(i)
+    if env != '*':
+        query.add(EqualsOperator('catalog_environment', env))
+    elif len(query.operations) == 0:
+        return None
+    return query
+
+
 def check_env(env, envs):
     if env != '*' and env not in envs:
         abort(404)
@@ -151,6 +253,62 @@ def server_error(e):
     return render_template('500.html', envs=envs), 500
 
 
+def status_count(env):
+    """Method used by radiator and index.
+    Return nodes count by status (with percents)
+    """
+    stats = {}
+
+    # num_nodes
+    stats['total'] = get_count('nodes', get_node_env_query(env))
+
+    # per status bucket (noop handled in unchanged)
+    for status_arg in ['changed', 'failed', 'unchanged', 'unreported']:
+        arg_query = get_node_status_query(status_arg)
+        if status_arg == 'unchanged':
+            res = puppetdb.nodes(query=arg_query)
+            unchanged = 0
+            noop = 0
+            for node in res:
+                if node.status == 'unchanged':
+                    unchanged += 1
+                else:
+                    noop += 1
+            stats['unchanged'] = unchanged
+            stats['noop'] = noop
+        else:
+            stats[status_arg] = get_count(
+                'nodes', get_node_env_query(env, arg_query))
+        try:
+            stats["%s_percent" % status_arg] = int(
+                100 * stats[status_arg] / float(stats['total']))
+        except ZeroDivisionError:
+            stats["%s_percent" % status_arg] = 0
+
+    return stats
+
+
+@app.route('/radiator', defaults={'env': app.config['DEFAULT_ENVIRONMENT']})
+@app.route('/<env>/radiator')
+def radiator(env):
+    """This view generates a simplified monitoring page
+    akin to the radiator view in puppet dashboard
+    """
+    envs = environments()
+    check_env(env, envs)
+
+    stats = status_count(env)
+
+    if ('Accept' in request.headers and
+            request.headers["Accept"] == 'application/json'):
+        return jsonify(**stats)
+
+    return render_template(
+        'radiator.html',
+        stats=stats,
+    )
+
+
 @app.route('/', defaults={'env': app.config['DEFAULT_ENVIRONMENT']})
 @app.route('/<env>/')
 def index(env):
@@ -161,15 +319,21 @@ def index(env):
     :type env: :obj:`string`
     """
     envs = environments()
-    metrics = {
-        'num_nodes': 0,
-        'num_resources': 0,
-        'avg_resources_node': 0}
     check_env(env, envs)
 
-    if env == '*':
-        query = app.config['OVERVIEW_FILTER']
+    stats = status_count(env)
+    if stats['total'] < 1000:
+        stats['num_resources'] = get_count(
+            'resources', EqualsOperator("environment", env))
 
+        # average resource / node
+        try:
+            stats['avg_resources_node'] = "{0:10.0f}".format(
+                (stats['num_resources'] / stats['total']))
+        except ZeroDivisionError:
+            stats['avg_resources_node'] = 0
+
+    else:
         prefix = 'puppetlabs.puppetdb.population'
         query_type = ''
 
@@ -178,149 +342,127 @@ def index(env):
         if get_db_version(puppetdb) < (4, 0, 0):
             query_type = 'type=default,'
 
-        num_nodes = get_or_abort(
-            puppetdb.metric,
-            "{0}{1}".format(prefix, ':%sname=num-nodes' % query_type))
-        num_resources = get_or_abort(
-            puppetdb.metric,
-            "{0}{1}".format(prefix, ':%sname=num-resources' % query_type))
-        avg_resources_node = get_or_abort(
-            puppetdb.metric,
-            "{0}{1}".format(prefix,
-                            ':%sname=avg-resources-per-node' % query_type))
-        metrics['num_nodes'] = num_nodes['Value']
-        metrics['num_resources'] = num_resources['Value']
-        metrics['avg_resources_node'] = "{0:10.0f}".format(
-            avg_resources_node['Value'])
-    else:
-        query = AndOperator()
-        query.add(EqualsOperator('catalog_environment', env))
-        query.add(EqualsOperator('facts_environment', env))
+        stats['num_resources'] = get_or_abort(
+            puppetdb.metric, "{0}{1}".format(
+                prefix, ':%sname=num-resources' % query_type))['Value']
+        stats['avg_resources_node'] = int(get_or_abort(
+            puppetdb.metric, "{0}{1}".format(
+                prefix,
+                ':%sname=avg-resources-per-node' % query_type))['Value'])
 
-        num_nodes_query = ExtractOperator()
-        num_nodes_query.add_field(FunctionOperator('count'))
-        num_nodes_query.add_query(query)
-
-        if app.config['OVERVIEW_FILTER'] is not None:
-            query.add(app.config['OVERVIEW_FILTER'])
-
-        num_resources_query = ExtractOperator()
-        num_resources_query.add_field(FunctionOperator('count'))
-        num_resources_query.add_query(EqualsOperator("environment", env))
-
-        num_nodes = get_or_abort(
-            puppetdb._query,
-            'nodes',
-            query=num_nodes_query)
-        num_resources = get_or_abort(
-            puppetdb._query,
-            'resources',
-            query=num_resources_query)
-        metrics['num_nodes'] = num_nodes[0]['count']
-        metrics['num_resources'] = num_resources[0]['count']
-        try:
-            metrics['avg_resources_node'] = "{0:10.0f}".format(
-                (num_resources[0]['count'] / num_nodes[0]['count']))
-        except ZeroDivisionError:
-            metrics['avg_resources_node'] = 0
-
+    paging_args = {'limit': app.config['NORMAL_TABLE_COUNT'], 'offset': 0}
+    order_arg = '[{"field": "catalog_timestamp", "order": "desc"}]'
     nodes = get_or_abort(puppetdb.nodes,
-                         query=query,
+                         query=get_node_env_query(env),
                          unreported=app.config['UNRESPONSIVE_HOURS'],
-                         with_status=True)
-
-    nodes_overview = []
-    stats = {
-        'changed': 0,
-        'unchanged': 0,
-        'failed': 0,
-        'unreported': 0,
-        'noop': 0
-    }
-
-    for node in nodes:
-        if node.status == 'unreported':
-            stats['unreported'] += 1
-        elif node.status == 'changed':
-            stats['changed'] += 1
-        elif node.status == 'failed':
-            stats['failed'] += 1
-        elif node.status == 'noop':
-            stats['noop'] += 1
-        else:
-            stats['unchanged'] += 1
-
-        if node.status != 'unchanged':
-            nodes_overview.append(node)
+                         with_status=True,
+                         order_by=order_arg,
+                         **paging_args)
 
     return render_template(
         'index.html',
-        metrics=metrics,
-        nodes=nodes_overview,
+        nodes=nodes,
         stats=stats,
         envs=envs,
         current_env=env
     )
 
 
-@app.route('/nodes', defaults={'env': app.config['DEFAULT_ENVIRONMENT']})
-@app.route('/<env>/nodes')
-def nodes(env):
-    """Fetch all (active) nodes from PuppetDB and stream a table displaying
-    those nodes.
-
-    Downside of the streaming aproach is that since we've already sent our
-    headers we can't abort the request if we detect an error. Because of this
-    we'll end up with an empty table instead because of how yield_or_stop
-    works. Once pagination is in place we can change this but we'll need to
-    provide a search feature instead.
+@app.route('/nodes',
+           defaults={'env': app.config['DEFAULT_ENVIRONMENT'], 'status': None})
+@app.route('/<env>/nodes', defaults={'status': None})
+@app.route('/nodes/<status>',
+           defaults={'env': app.config['DEFAULT_ENVIRONMENT']})
+@app.route('/<env>/nodes/<status>')
+def nodes(env, status):
+    """Display all (active) nodes from PuppetDB (with Jquery datatables)
 
     :param env: Search for nodes in this (Catalog and Fact) environment
     :type env: :obj:`string`
     """
     envs = environments()
-    status_arg = request.args.get('status', '')
     check_env(env, envs)
+    return render_template(
+        'nodes.html',
+        envs=envs,
+        current_env=env,
+        status_pick=status,
+        columns=NODES_COLUMNS)
 
+
+@app.route('/nodes/json', defaults={'env': app.config['DEFAULT_ENVIRONMENT']})
+@app.route('/<env>/nodes/json')
+def nodes_ajax(env):
+    """Query and return JSON data for nodes pages
+
+    :param env: Search for nodes in this (Catalog and Fact) environment
+    :type env: :obj:`string`
+    """
+    draw = int(request.args.get('draw', 0))
+    start = int(request.args.get('start', 0))
+    length = int(request.args.get('length', app.config['NORMAL_TABLE_COUNT']))
+    paging_args = {'limit': length, 'offset': start}
+    search_arg = request.args.get('search[value]')
+    order_column = int(request.args.get('order[0][column]', 0))
+    order_filter = NODES_COLUMNS[order_column].get(
+        'filter', NODES_COLUMNS[order_column]['attr'])
+    order_dir = request.args.get('order[0][dir]', 'desc')
+    order_args = '[{"field": "%s", "order": "%s"}]' % (order_filter, order_dir)
+    status_args = request.args.get('columns[1][search][value]', '').split('|')
+
+    envs = environments()
+    check_env(env, envs)
     query = AndOperator()
 
     if env != '*':
         query.add(EqualsOperator("catalog_environment", env))
-        query.add(EqualsOperator("facts_environment", env))
 
-    if status_arg in ['failed', 'changed', 'unchanged']:
-        query.add(EqualsOperator('latest_report_status', status_arg))
-    elif status_arg == 'unreported':
-        unreported = datetime.datetime.utcnow()
-        unreported = (unreported -
-                      timedelta(hours=app.config['UNRESPONSIVE_HOURS']))
-        unreported = unreported.replace(microsecond=0).isoformat()
+    if search_arg:
+        search_query = OrOperator()
+        search_query.add(RegexOperator("certname", r"%s" % search_arg))
+        query.add(search_query)
 
-        unrep_query = OrOperator()
-        unrep_query.add(NullOperator('report_timestamp', True))
-        unrep_query.add(LessEqualOperator('report_timestamp', unreported))
+    status_query = OrOperator()
+    for status_arg in status_args:
+        if status_arg not in ['', '*', 'none']:
+            arg_query = get_node_status_query(status_arg)
+            if arg_query:
+                status_query.add(arg_query)
 
-        query.add(unrep_query)
+    if len(status_query.operations) == 0:
+        if len(query.operations) == 0:
+            query = None
+    else:
+        query.add(status_query)
 
-    if len(query.operations) == 0:
-        query = None
+    if status_args[0] != 'none':
+        nodes = get_or_abort(
+            puppetdb.nodes,
+            query=query,
+            order_by=order_args,
+            with_status=True,
+            unreported=app.config['UNRESPONSIVE_HOURS'],
+            include_total=True,
+            **paging_args)
+        nodes, nodes_events = tee(nodes)
+        for r in nodes_events:
+            break
+        total = puppetdb.total
+        if total is None:
+            total = 0
+    else:
+        nodes = []
+        total = 0
 
-    nodelist = puppetdb.nodes(
-        query=query,
-        unreported=app.config['UNRESPONSIVE_HOURS'],
-        with_status=True)
-    nodes = []
-    for node in yield_or_stop(nodelist):
-        if status_arg:
-            if node.status == status_arg:
-                nodes.append(node)
-        else:
-            nodes.append(node)
-    return Response(stream_with_context(
-        stream_template('nodes.html',
-                        nodes=nodes,
-                        envs=envs,
-                        current_env=env)))
+    return render_template(
+        'nodes.json.tpl',
+        draw=draw,
+        total=total,
+        total_filtered=total,
+        nodes=nodes,
+        envs=envs,
+        current_env=env,
+        columns=NODES_COLUMNS)
 
 
 def inventory_facts():
@@ -511,18 +653,13 @@ def reports_ajax(env, node_name):
         if status_arg in ['failed', 'changed', 'unchanged']:
             arg_query = AndOperator()
             arg_query.add(EqualsOperator('status', status_arg))
-            arg_query.add(EqualsOperator('noop', False))
-            status_query.add(arg_query)
             if status_arg == 'unchanged':
-                arg_query = AndOperator()
-                arg_query.add(EqualsOperator('noop', True))
-                arg_query.add(EqualsOperator('noop_pending', False))
-                status_query.add(arg_query)
-        elif status_arg == 'noop':
-            arg_query = AndOperator()
-            arg_query.add(EqualsOperator('noop', True))
-            arg_query.add(EqualsOperator('noop_pending', True))
+                noop_query = NotOperator()
+                noop_query.add(get_reports_noop_query())
+                arg_query.add(noop_query)
             status_query.add(arg_query)
+        elif status_arg == 'noop':
+            status_query.add(get_reports_noop_query())
 
     if len(status_query.operations) == 0:
         if len(reports_query.operations) == 0:
@@ -537,26 +674,14 @@ def reports_ajax(env, node_name):
             order_by=order_args,
             include_total=True,
             **paging_args)
-        reports, reports_events = tee(reports)
-        total = None
+        reports, reports_total = tee(reports)
+        for r in reports_total:
+            break
+        total = puppetdb.total
+        if total is None:
+            total = 0
     else:
         reports = []
-        reports_events = []
-        total = 0
-
-    # Convert metrics to relational dict
-    metrics = {}
-    for report in reports_events:
-        if total is None:
-            total = puppetdb.total
-
-        metrics[report.hash_] = {}
-        for m in report.metrics:
-            if m['category'] not in metrics[report.hash_]:
-                metrics[report.hash_][m['category']] = {}
-            metrics[report.hash_][m['category']][m['name']] = m['value']
-
-    if total is None:
         total = 0
 
     return render_template(
@@ -565,7 +690,6 @@ def reports_ajax(env, node_name):
         total=total,
         total_filtered=total,
         reports=reports,
-        metrics=metrics,
         envs=envs,
         current_env=env,
         columns=REPORTS_COLUMNS[:max_col])
@@ -1021,104 +1145,6 @@ def catalog_compare(env, compare, against):
     else:
         log.warn('Access to catalog interface disabled by administrator')
         abort(403)
-
-
-@app.route('/radiator', defaults={'env': app.config['DEFAULT_ENVIRONMENT']})
-@app.route('/<env>/radiator')
-def radiator(env):
-    """This view generates a simplified monitoring page
-    akin to the radiator view in puppet dashboard
-    """
-    envs = environments()
-    check_env(env, envs)
-
-    if env == '*':
-        query_type = ''
-        if get_db_version(puppetdb) < (4, 0, 0):
-            query_type = 'type=default,'
-        query = None
-        metrics = get_or_abort(
-            puppetdb.metric,
-            'puppetlabs.puppetdb.population:%sname=num-nodes' % query_type)
-        num_nodes = metrics['Value']
-    else:
-        query = AndOperator()
-        metric_query = ExtractOperator()
-
-        query.add(EqualsOperator("catalog_environment", env))
-        query.add(EqualsOperator("facts_environment", env))
-        metric_query.add_field(FunctionOperator('count'))
-        metric_query.add_query(query)
-
-        metrics = get_or_abort(
-            puppetdb._query,
-            'nodes',
-            query=metric_query)
-        num_nodes = metrics[0]['count']
-
-    nodes = puppetdb.nodes(
-        query=query,
-        unreported=app.config['UNRESPONSIVE_HOURS'],
-        with_status=True
-    )
-
-    stats = {
-        'changed_percent': 0,
-        'changed': 0,
-        'failed_percent': 0,
-        'failed': 0,
-        'noop_percent': 0,
-        'noop': 0,
-        'skipped_percent': 0,
-        'skipped': 0,
-        'unchanged_percent': 0,
-        'unchanged': 0,
-        'unreported_percent': 0,
-        'unreported': 0,
-    }
-
-    for node in nodes:
-        if node.status == 'unreported':
-            stats['unreported'] += 1
-        elif node.status == 'changed':
-            stats['changed'] += 1
-        elif node.status == 'failed':
-            stats['failed'] += 1
-        elif node.status == 'noop':
-            stats['noop'] += 1
-        elif node.status == 'skipped':
-            stats['skipped'] += 1
-        else:
-            stats['unchanged'] += 1
-
-    try:
-        stats['changed_percent'] = int(100 * (stats['changed'] /
-                                              float(num_nodes)))
-        stats['failed_percent'] = int(100 * stats['failed'] / float(num_nodes))
-        stats['noop_percent'] = int(100 * stats['noop'] / float(num_nodes))
-        stats['skipped_percent'] = int(100 * (stats['skipped'] /
-                                              float(num_nodes)))
-        stats['unchanged_percent'] = int(100 * (stats['unchanged'] /
-                                                float(num_nodes)))
-        stats['unreported_percent'] = int(100 * (stats['unreported'] /
-                                                 float(num_nodes)))
-    except ZeroDivisionError:
-        stats['changed_percent'] = 0
-        stats['failed_percent'] = 0
-        stats['noop_percent'] = 0
-        stats['skipped_percent'] = 0
-        stats['unchanged_percent'] = 0
-        stats['unreported_percent'] = 0
-
-    if ('Accept' in request.headers and
-            request.headers["Accept"] == 'application/json'):
-        return jsonify(**stats)
-
-    return render_template(
-        'radiator.html',
-        stats=stats,
-        total=num_nodes
-    )
 
 
 @app.route('/daily_reports_chart.json',
